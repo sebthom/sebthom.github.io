@@ -1,0 +1,111 @@
+# https://docs.github.com/en/free-pro-team@latest/actions/reference/workflow-syntax-for-github-actions
+name: Renew Certificate
+
+on:
+  schedule:
+    # https://docs.github.com/en/free-pro-team@latest/actions/reference/events-that-trigger-workflows
+    - cron: '23 15 * * *'
+  workflow_dispatch:
+    # https://github.blog/changelog/2020-07-06-github-actions-manual-triggers-with-workflow_dispatch/
+    inputs:
+      force_renewal:
+        description: "Force certificate renewal"
+        required: false
+        default: false
+        type: boolean
+      force_secret_update:
+        description: "Force updating of the GHA secrets."
+        required: false
+        default: false
+        type: boolean
+      debug-with-ssh:
+        description: "Start an SSH session for debugging purposes after tests ran:"
+        default: never
+        type: choice
+        options: [ always, on_failure, on_failure_or_cancelled, never ]
+      debug-with-ssh-only-for-actor:
+        description: "Limit access to the SSH session to the GitHub user that triggered the job."
+        default: true
+        type: boolean
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+
+  renew_cert:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Show environment variables
+      run: env | sort
+
+    - name: Git Checkout
+      uses: actions/checkout@v3 #https://github.com/actions/checkout
+
+    - name: Renew certificate
+      env: 
+        CERTDB: ${{ secrets.CERTDB }}
+        GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      run: |
+        set -euo pipefail
+        echo "$CERTDB" > certdb.tar.gz.base64
+        base64 --decode certdb.tar.gz.base64 > certdb.tar.gz
+
+        (set -x; docker run --rm \
+          -v "$PWD:/workdir" \
+          --entrypoint "/bin/sh" \
+          -e CERT_FQDN=sebthom.github.io \
+          -e CERT_ARCHIVE_IN=/workdir/certdb.tar.gz \
+          -e CERT_ARCHIVE_OUT=/workdir/certdb_updated.tar.gz \
+          -e CERT_USE_TEST_CA=false \
+          -e CERT_FORCE_RENEWAL="${{ inputs.force_renewal }}" \
+          -e CERTBOT_OPTIONS=-v \
+          certbot/certbot:latest \
+          /workdir/gen_cert.sh)
+
+        if [[ "${{ inputs.force_secret_update }}" == "true" && ! -f certdb_updated.tar.gz.base64 ]]; then
+          cp certdb.tar.gz.base64 certdb_updated.tar.gz.base64
+        fi
+
+        if [[ -f certdb_updated.tar.gz.base64 ]]; then
+          echo "Updating secrets..."
+          gh repo list --no-archived --json name,isFork,repositoryTopics
+          eclipse_plugin_repos=$(gh repo list --no-archived \
+            --json "name,isFork,repositoryTopics" \
+            --jq ".[] | select((.isFork == false) and (.repositoryTopics[]?.name == \"eclipse-plugin\")) | .name" \
+          )
+          for repo in sebthom.github.io $eclipse_plugin_repos; do
+            (set -x; gh secret set -R sebthom/$repo CERTDB < certdb_updated.tar.gz.base64)
+          done
+        fi
+
+
+    ##################################################
+    # Setup SSH debug session
+    ##################################################
+    - name: "SSH session for debugging: check"
+      id: DEBUG_SSH_SESSSION_CHECK
+      if: always()
+      shell: bash
+      run: |
+        set -eu
+        job_filter_pattern="${{ inputs.debug-with-ssh-only-jobs-matching }}"
+        echo "job_filter: $job_filter_pattern"
+
+        job_info=$(echo "$GITHUB_JOB ${{ runner.os }} haxe-${{ matrix.haxe-version }}" | tr -d '\n')
+        echo "job_info: $job_info"
+
+        if [[ "$job_info" =~ .*$job_filter_pattern.* ]] && case "${{ job.status }}" in
+           success)   [[ "${{ inputs.debug-with-ssh }}" == always ]] ;;
+           cancelled) [[ "${{ inputs.debug-with-ssh }}" == on_failure_or_cancelled ]] ;;
+           failure)   [[ "${{ inputs.debug-with-ssh }}" =~ on_failure.* ]] ;;
+        esac; then
+           echo "start_session=true" | tee -a "$GITHUB_OUTPUT"
+        fi
+
+    - name: "SSH session for debugging: start"
+      uses: mxschmitt/action-tmate@v3 # https://github.com/mxschmitt/action-tmate
+      if: always() && steps.DEBUG_SSH_SESSSION_CHECK.outputs.start_session
+      with:
+        limit-access-to-actor: ${{ inputs.debug-with-ssh-only-for-actor }}
