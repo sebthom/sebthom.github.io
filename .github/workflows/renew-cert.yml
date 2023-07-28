@@ -42,41 +42,75 @@ jobs:
 
     - name: Git Checkout
       uses: actions/checkout@v3 #https://github.com/actions/checkout
+      with:
+        # https://stackoverflow.com/a/70822562/5116073
+        persist-credentials: false # otherwise, the token used is the GITHUB_TOKEN, instead of your personal access token.
+        fetch-depth: 0 # otherwise, there would be errors pushing refs to the destination repository.
+
+    - name: Configure fast APT repository mirror
+      if: env.ACT
+      uses: vegardit/fast-apt-mirror.sh@v1
+
+    - name: "Install: GitHub command line client"
+      if: env.ACT
+      run: |
+        set -euo pipefail
+        sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+        sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+        sudo apt-get update
+        sudo apt-get install -y gh -y
+        gh --version
 
     - name: Renew certificate
-      env: 
+      env:
         CERTDB: ${{ secrets.CERTDB }}
         GH_TOKEN: ${{ secrets.GH_TOKEN }}
       run: |
         set -euo pipefail
-        echo "$CERTDB" > certdb.tar.gz.base64
-        base64 --decode certdb.tar.gz.base64 > certdb.tar.gz
+
+        CERT_USE_TEST_CA=$( [[ ${ACT:-} == "true" ]] && echo "true" || echo "false")
+
+        CERTDB_IN_TGZ=certdb.tar.gz
+        CERTDB_OUT_TGZ=certdb_updated.tar.gz
+
+        echo "$CERTDB" | base64 --decode > $CERTDB_IN_TGZ
 
         (set -x; docker run --rm \
           -v "$PWD:/workdir" \
-          --entrypoint "/bin/sh" \
-          -e CERT_FQDN=sebthom.github.io \
-          -e CERT_ARCHIVE_IN=/workdir/certdb.tar.gz \
-          -e CERT_ARCHIVE_OUT=/workdir/certdb_updated.tar.gz \
-          -e CERT_USE_TEST_CA=false \
+          --entrypoint /bin/sh \
+          -w /workdir \
+          -e CERTDB_IN_TGZ=$CERTDB_IN_TGZ \
+          -e CERTDB_OUT_TGZ=$CERTDB_OUT_TGZ \
+          -e CERT_USE_TEST_CA=$CERT_USE_TEST_CA \
           -e CERT_FORCE_RENEWAL="${{ inputs.force_renewal }}" \
           -e CERTBOT_OPTIONS=-v \
+          -e GH_TOKEN=$GH_TOKEN \
+          -e GITHUB_REF_NAME=$GITHUB_REF_NAME \
           certbot/certbot:latest \
-          /workdir/gen_cert.sh)
+          gen_cert.sh)
 
-        if [[ "${{ inputs.force_secret_update }}" == "true" && ! -f certdb_updated.tar.gz.base64 ]]; then
-          cp certdb.tar.gz.base64 certdb_updated.tar.gz.base64
+        if [[ "${{ inputs.force_secret_update }}" == "true" && ! -f $CERTDB_OUT_TGZ ]]; then
+          cp $CERTDB_IN_TGZ $CERTDB_OUT_TGZ
         fi
 
-        if [[ -f certdb_updated.tar.gz.base64 ]]; then
+        if [[ -f $CERTDB_OUT_TGZ ]]; then
           echo "Updating secrets..."
-          gh repo list --no-archived --json name,isFork,repositoryTopics
+
+          #gh repo list --no-archived --json name,isFork,repositoryTopics
           eclipse_plugin_repos=$(gh repo list --no-archived \
             --json "name,isFork,repositoryTopics" \
             --jq ".[] | select((.isFork == false) and (.repositoryTopics[]?.name == \"eclipse-plugin\")) | .name" \
           )
+
+          base64 -w 0 $CERTDB_OUT_TGZ >${CERTDB_OUT_TGZ}.base64
+
           for repo in sebthom.github.io $eclipse_plugin_repos; do
-            (set -x; gh secret set -R sebthom/$repo CERTDB < certdb_updated.tar.gz.base64)
+            if [[ ${CERT_USE_TEST_CA:-} == "true" ]]; then
+              echo "DRY_RUN: secret set -R sebthom/$repo CERTDB"
+            else 
+              (set -x; gh secret set -R sebthom/$repo CERTDB < ${CERTDB_OUT_TGZ}.base64)
+            fi
           done
         fi
 

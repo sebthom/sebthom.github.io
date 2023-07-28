@@ -1,0 +1,2 @@
+# config file for https://github.com/nektos/act
+--secret-file _LOCAL/act.secrets
