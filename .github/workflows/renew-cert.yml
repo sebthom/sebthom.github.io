@@ -41,7 +41,7 @@ jobs:
       run: env | sort
 
     - name: Git Checkout
-      uses: actions/checkout@v4 #https://github.com/actions/checkout
+      uses: actions/checkout@v5 #https://github.com/actions/checkout
       with:
         # https://stackoverflow.com/a/70822562/5116073
         persist-credentials: false # otherwise, the token used is the GITHUB_TOKEN, instead of your personal access token.
